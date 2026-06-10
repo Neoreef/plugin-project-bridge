@@ -46,28 +46,15 @@ const manifest: PaperclipPluginManifestV1 = {
     worker: "./dist/worker.js",
     ui: "./dist/ui",
   },
+  // Source of truth — see SETTINGS_MODEL.md.
+  //   • OAuth credentials (clientId, clientSecret, callbackUrl, dataCenter) are
+  //     stored PER-SERVICE in plugin state (`bridge.service.{id}.config`), set
+  //     via the settings UI. They are intentionally NOT declared here.
+  //   • Feature toggles and the Projects portal/Desk org identifiers below are
+  //     instance-level settings and live in this manifest config.
   instanceConfigSchema: {
     type: "object",
     properties: {
-      zohoClientId: {
-        type: "string",
-        title: "Zoho Client ID",
-      },
-      zohoClientSecret: {
-        type: "string",
-        title: "Zoho Client Secret",
-      },
-      dataCenter: {
-        type: "string",
-        title: "Zoho Data Center",
-        enum: ["US", "EU", "IN", "AU", "JP", "CA"],
-        default: "US",
-      },
-      oauthCallbackUrl: {
-        type: "string",
-        title: "OAuth Callback URL",
-        description: "Full URL for OAuth redirect (e.g. https://cortex.neoreef.com:8443/paperclip/api/plugins/{pluginId}/routes/callback). Must match the redirect URI registered in Zoho API Console.",
-      },
       projectsEnabled: {
         type: "boolean",
         title: "Enable Zoho Projects Sync",

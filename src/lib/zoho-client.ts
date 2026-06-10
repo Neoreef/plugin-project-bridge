@@ -36,42 +36,92 @@ function getAuthHeader(service: ZohoService, token: string): string {
   return `Zoho-oauthtoken ${token}`;
 }
 
-async function getAuth(ctx: PluginContext): Promise<ZohoAuthState> {
-  // Check global auth first (backwards compat)
-  const global = (await ctx.state.get({ scopeKind: "instance", stateKey: "zoho.auth" })) as ZohoAuthState | null;
-  if (global?.refreshToken) return global;
+/**
+ * Per-service OAuth config — the single source of truth for Zoho credentials.
+ * Written by the settings UI via the `save-service-oauth-config` action and the
+ * OAuth callback handler. Mirrors `ServiceOAuthConfig` in worker.ts.
+ */
+type ServiceOAuthConfig = {
+  clientId?: string;
+  clientSecret?: string;
+  callbackUrl?: string;
+  dataCenter?: DataCenterKey;
+};
 
-  // Check per-service auth (new pattern)
+/** Resolved auth plus the service it belongs to (null for the legacy global slot). */
+type ResolvedAuth = { auth: ZohoAuthState; serviceId: string | null };
+
+function serviceConfigKey(serviceId: string): string {
+  return `bridge.service.${serviceId}.config`;
+}
+
+function serviceAuthKey(serviceId: string): string {
+  return `bridge.service.${serviceId}.auth`;
+}
+
+async function getAuth(ctx: PluginContext): Promise<ResolvedAuth> {
+  // Check global auth first (legacy: seeded via `seed-auth`, pre-per-service installs)
+  const global = (await ctx.state.get({ scopeKind: "instance", stateKey: "zoho.auth" })) as ZohoAuthState | null;
+  if (global?.refreshToken) return { auth: global, serviceId: null };
+
+  // Check per-service auth (current pattern)
   const services = ((await ctx.state.get({ scopeKind: "instance", stateKey: "bridge.services" })) as Array<{ id: string }> | null) ?? [];
   for (const svc of services) {
-    const auth = (await ctx.state.get({ scopeKind: "instance", stateKey: `bridge.service.${svc.id}.auth` })) as ZohoAuthState | null;
-    if (auth?.refreshToken) return auth;
+    const auth = (await ctx.state.get({ scopeKind: "instance", stateKey: serviceAuthKey(svc.id) })) as ZohoAuthState | null;
+    if (auth?.refreshToken) return { auth, serviceId: svc.id };
   }
 
   throw new Error("Zoho not connected. Please complete OAuth setup in plugin settings.");
 }
 
-async function saveAuth(ctx: PluginContext, auth: ZohoAuthState): Promise<void> {
-  // Save to global for backwards compat with zoho-client callers
-  await ctx.state.set({ scopeKind: "instance", stateKey: "zoho.auth" }, auth);
+/**
+ * Resolve OAuth credentials from per-service state — the single source of truth.
+ * Credentials live in `bridge.service.{id}.config`, NOT in the manifest
+ * `instanceConfigSchema` (the manifest credential fields were removed in NEO-89).
+ * For the legacy global auth slot (no serviceId) we fall back to the first
+ * service that has credentials configured, so token refresh works regardless of
+ * the manifest top-level config.
+ */
+async function getOAuthCredentials(
+  ctx: PluginContext,
+  serviceId: string | null,
+): Promise<{ clientId: string; clientSecret: string }> {
+  if (serviceId) {
+    const cfg = (await ctx.state.get({ scopeKind: "instance", stateKey: serviceConfigKey(serviceId) })) as ServiceOAuthConfig | null;
+    if (cfg?.clientId && cfg?.clientSecret) {
+      return { clientId: cfg.clientId, clientSecret: cfg.clientSecret };
+    }
+  }
+
+  // Legacy global auth: find any service that has credentials configured.
+  const services = ((await ctx.state.get({ scopeKind: "instance", stateKey: "bridge.services" })) as Array<{ id: string }> | null) ?? [];
+  for (const svc of services) {
+    const cfg = (await ctx.state.get({ scopeKind: "instance", stateKey: serviceConfigKey(svc.id) })) as ServiceOAuthConfig | null;
+    if (cfg?.clientId && cfg?.clientSecret) {
+      return { clientId: cfg.clientId, clientSecret: cfg.clientSecret };
+    }
+  }
+
+  throw new Error("Missing Zoho Client ID or Client Secret. Configure credentials in the service connection settings.");
 }
 
-async function refreshAccessToken(ctx: PluginContext): Promise<string> {
-  const auth = await getAuth(ctx);
-  const config = (await ctx.config.get()) as {
-    zohoClientId?: string;
-    zohoClientSecret?: string;
-  };
+async function saveAuth(ctx: PluginContext, resolved: ResolvedAuth): Promise<void> {
+  // Persist refreshed tokens back to the same slot they were read from, so each
+  // service keeps its own tokens isolated.
+  const stateKey = resolved.serviceId ? serviceAuthKey(resolved.serviceId) : "zoho.auth";
+  await ctx.state.set({ scopeKind: "instance", stateKey }, resolved.auth);
+}
 
-  if (!config.zohoClientId || !config.zohoClientSecret) {
-    throw new Error("Missing Zoho Client ID or Client Secret in plugin settings.");
-  }
+async function refreshAccessToken(ctx: PluginContext, resolved?: ResolvedAuth): Promise<string> {
+  const current = resolved ?? (await getAuth(ctx));
+  const { auth, serviceId } = current;
+  const { clientId, clientSecret } = await getOAuthCredentials(ctx, serviceId);
 
   const center = getDataCenter(auth.dataCenter);
   const params = new URLSearchParams({
     refresh_token: auth.refreshToken,
-    client_id: config.zohoClientId,
-    client_secret: config.zohoClientSecret,
+    client_id: clientId,
+    client_secret: clientSecret,
     grant_type: "refresh_token",
   });
 
@@ -96,16 +146,17 @@ async function refreshAccessToken(ctx: PluginContext): Promise<string> {
     accessToken: data.access_token,
     expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000 - TOKEN_SAFETY_MARGIN_MS,
   };
-  await saveAuth(ctx, updated);
+  await saveAuth(ctx, { auth: updated, serviceId });
   return data.access_token;
 }
 
 async function getAccessToken(ctx: PluginContext): Promise<{ token: string; dataCenter: DataCenterKey }> {
-  const auth = await getAuth(ctx);
+  const resolved = await getAuth(ctx);
+  const { auth } = resolved;
   if (auth.accessToken && auth.expiresAt && Date.now() < auth.expiresAt) {
     return { token: auth.accessToken, dataCenter: auth.dataCenter };
   }
-  const token = await refreshAccessToken(ctx);
+  const token = await refreshAccessToken(ctx, resolved);
   return { token, dataCenter: auth.dataCenter };
 }
 
@@ -212,10 +263,10 @@ async function safeJson(res: Response): Promise<unknown> {
 /** Proactive token refresh for the scheduled job */
 export async function proactiveTokenRefresh(ctx: PluginContext): Promise<void> {
   try {
-    const auth = await getAuth(ctx);
-    const timeUntilExpiry = auth.expiresAt - Date.now();
+    const resolved = await getAuth(ctx);
+    const timeUntilExpiry = resolved.auth.expiresAt - Date.now();
     if (timeUntilExpiry < 15 * 60_000) {
-      await refreshAccessToken(ctx);
+      await refreshAccessToken(ctx, resolved);
     }
   } catch {
     // No auth configured yet — skip
