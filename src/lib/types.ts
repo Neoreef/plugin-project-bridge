@@ -47,6 +47,8 @@ export type NormalizedProjectsTask = {
   assignee?: string;
   assignedAgent?: string;
   parentTaskId?: string;
+  /** Zoho's last-updated marker for the task, if present — used for event de-dup. */
+  updatedTime?: string;
   completed: boolean;
   customFields: Record<string, string>;
   tags?: string[];

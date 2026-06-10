@@ -13,6 +13,13 @@ import { PRIORITY_MAP, PROJECTS_STATUS_MAP } from "../../constants.js";
 import type { GroupMappingEntry, NormalizedProjectsTask, ProjectMappingEntry } from "../../lib/types.js";
 import { projectsFetch } from "../../lib/zoho-client.js";
 import { resolveAgent } from "./agent-mapping.js";
+import {
+  claimInboundEvent,
+  consumeInboundSuppression,
+  eventFingerprint,
+  suppressNextOutbound,
+} from "./sync-guard.js";
+import { PROJECTS_TASK_ORIGIN_KIND, saveTaskMapping } from "./task-mapping.js";
 
 /**
  * Parse the raw webhook body — handles both JSON and form-encoded (data=<JSON>).
@@ -141,6 +148,15 @@ export function normalizeProjectsPayload(raw: Record<string, unknown>): Normaliz
   // Project info
   const project = (raw.Project ?? raw.project ?? raw.Projects ?? {}) as Record<string, string>;
 
+  // Last-updated marker (varies by Zoho payload shape) — feeds event de-dup so a
+  // genuine later change isn't collapsed with an earlier identical-looking one.
+  const updatedTime =
+    (task.last_updated_time as string) ??
+    (task.last_updated_time_long as string | number)?.toString() ??
+    (task.last_updated_date as string) ??
+    (task.updated_time as string) ??
+    undefined;
+
   return {
     taskId: String(task.id ?? task.id_string ?? ""),
     taskName: (task.name ?? task.title ?? "") as string,
@@ -153,6 +169,7 @@ export function normalizeProjectsPayload(raw: Record<string, unknown>): Normaliz
     assignee: assignedAgent.trim() || undefined,
     assignedAgent: assignedAgent.trim() || undefined,
     parentTaskId: (task.parent_task_id as string) ?? undefined,
+    updatedTime,
     completed,
     customFields,
     tags,
@@ -349,6 +366,42 @@ export async function handleProjectsWebhook(
   const raw = parseWebhookBody(rawBody, parsedBody) as Record<string, unknown>;
   const normalized = normalizeProjectsPayload(raw);
 
+  if (!normalized.taskId) {
+    ctx.logger.debug("Zoho Projects webhook has no task id — ignoring");
+    return;
+  }
+
+  // ─── Idempotency: drop duplicate / out-of-order webhook deliveries ──────────
+  // Fingerprint the semantic end-state (+ Zoho's update marker when present), so
+  // an at-least-once redelivery of the same event is a no-op while a genuine new
+  // change produces a distinct fingerprint and is processed.
+  const fingerprint = eventFingerprint([
+    "projects-task",
+    normalized.taskId,
+    normalized.updatedTime,
+    normalized.status,
+    normalized.completed,
+    normalized.priority,
+    normalized.assignedAgent,
+    normalized.taskName,
+    normalized.description,
+  ]);
+  if (!(await claimInboundEvent(ctx, fingerprint))) {
+    ctx.logger.info(`Duplicate Zoho task webhook for ${normalized.taskId} — ignoring (idempotency)`);
+    return;
+  }
+
+  // ─── Loop guard: ignore the inbound echo of our own outbound status write ────
+  // When outbound sync PUTs a status to Zoho, Zoho fires a webhook straight back.
+  // A matching armed marker means this delivery is that echo — skip it so the
+  // round-trip inbound → issue → outbound does not loop.
+  if (await consumeInboundSuppression(ctx, normalized.taskId, normalized.status)) {
+    ctx.logger.info(
+      `Inbound webhook for task ${normalized.taskId} echoes our own outbound write (status "${normalized.status}") — skipping (loop guard)`,
+    );
+    return;
+  }
+
   // Resolve project mapping — auto-create if needed
   const projectMappings = await getProjectMapping(ctx);
   let projectMap: ProjectMappingEntry | null = projectMappings.find((m) => m.zohoProjectId === normalized.projectId) ?? null;
@@ -382,7 +435,7 @@ export async function handleProjectsWebhook(
   }
 
   // Check for existing issue
-  const originKind = "plugin:project-bridge:projects-task";
+  const originKind = PROJECTS_TASK_ORIGIN_KIND;
   const originId = normalized.taskId;
 
   const existingIssues = await ctx.issues.list({
@@ -403,7 +456,14 @@ export async function handleProjectsWebhook(
     issueStatus = "todo";
   }
 
+  // Capture the portal id so outbound sync never has to guess it later.
+  const config = (await ctx.config.get()) as { portalId?: string };
+
   if (existing) {
+    // Loop guard: arm the marker BEFORE the write so the resulting `issue.updated`
+    // event is recognized as inbound-driven and not echoed back out to Zoho.
+    await suppressNextOutbound(ctx, existing.id, issueStatus);
+
     await ctx.issues.update(
       existing.id,
       {
@@ -413,6 +473,17 @@ export async function handleProjectsWebhook(
       },
       paperclipCompanyId,
     );
+
+    // Refresh the origin-identity record in case project/portal linkage changed.
+    await saveTaskMapping(ctx, {
+      zohoTaskId: normalized.taskId,
+      zohoProjectId: normalized.projectId,
+      portalId: config.portalId,
+      paperclipIssueId: existing.id,
+      paperclipCompanyId,
+      paperclipProjectId,
+    });
+
     ctx.logger.info(`Updated issue ${existing.id} from Zoho task ${normalized.taskId} (status: ${issueStatus})`);
   } else {
     const issue = await ctx.issues.create({
@@ -425,6 +496,21 @@ export async function handleProjectsWebhook(
       assigneeAgentId: agentId ?? undefined,
       originKind,
       originId,
+    });
+
+    // Loop guard: arm in case the host emits an `issue.updated` alongside create
+    // (e.g. status normalization) so that first event isn't echoed out to Zoho.
+    await suppressNextOutbound(ctx, issue.id, issueStatus);
+
+    // Persist the origin-identity convention so Paperclip → Zoho status sync can
+    // resolve project + task ids without relying on the unset originFingerprint.
+    await saveTaskMapping(ctx, {
+      zohoTaskId: normalized.taskId,
+      zohoProjectId: normalized.projectId,
+      portalId: config.portalId,
+      paperclipIssueId: issue.id,
+      paperclipCompanyId,
+      paperclipProjectId,
     });
 
     ctx.logger.info(`Created issue ${issue.id} from Zoho task ${normalized.taskId}: "${normalized.taskName}"`);
