@@ -76,8 +76,11 @@ claude.ai MCP connection) at the Zoho API console for the **US** DC:
 2. **Authorized redirect URI** — must exactly equal the deployed plugin's OAuth
    callback URL (the `oauth-callback` webhook endpoint, `src/manifest.ts:108-112`).
    It is stored per-service as `callbackUrl` and sent verbatim as `redirect_uri`
-   (`src/worker.ts:266`). Fill in once step 3 fixes the deploy URL, e.g.
-   `https://<deployed-plugin-host>/webhooks/project-bridge/oauth-callback`.
+   (`src/worker.ts:266`). The deployed instance is live (see §7.2), so the
+   redirect URI to register is:
+   `https://cortex.neoreef.com/api/plugins/project-bridge/webhooks/oauth-callback`
+   (NOT the UI default `https://cortex.neoreef.com:8443/oauth/callback`, which is
+   stale — `src/ui/index.tsx:209` predates the platform's `/api/plugins/...` mount).
 3. Copy the generated **Client ID** and **Client Secret**.
 
 > **Received 2026-06-12 (Werner):** Client ID `1000.DQF76AHIV90K2IWXCWUQ4FN6W1Y08A`
@@ -222,39 +225,56 @@ code hardening) are done and noted below.
   company** (single-company fallback, `projects-handler.ts:273-277`) or add a group
   mapping `Ungrouped Projects → <test company>` in settings.
 
-### 7.2 Deploy host — NO REACHABLE INSTANCE TODAY (probed 2026-06-12, Werner)
+### 7.2 Deploy host — LIVE & PUBLICLY REACHABLE (verified 2026-06-12, NEO-105/Gene)
 
-Active probing on **2026-06-12** disproves the earlier assumption that
-`cortex.neoreef.com:8443` is a working deploy target. There is **no publicly
-reachable Project Bridge instance** right now:
+**The earlier "not deployed" conclusion was wrong — it was a WRONG-URL artifact,
+not a missing deployment.** The Project Bridge plugin is in fact **installed,
+`ready`, worker running, and publicly reachable over valid HTTPS** on the cortex
+Paperclip instance. The 2026-06-12 probes all 404'd because they targeted a path
+the platform never mounts.
 
-| Probe (`POST … {}`) | Result |
+Platform fact: the Paperclip host mounts plugin webhooks at
+`POST /api/plugins/:pluginId/webhooks/:endpointKey`
+(`server/src/routes/plugins.ts:2495`), **not** `/webhooks/{plugin}/{key}`. And
+the `projects` webhook's `endpointKey` **value** is `"zoho-projects"`, not
+`"projects"` (`src/constants.ts:16` → `WEBHOOK_KEYS.projects = "zoho-projects"`).
+So the real inbound URL is:
+
+```
+https://cortex.neoreef.com/api/plugins/project-bridge/webhooks/zoho-projects
+```
+
+Verification (NEO-105, 2026-06-12):
+
+| Probe | Result |
 | --- | --- |
-| `https://cortex.neoreef.com:8443/webhooks/project-bridge/projects` | **connection refused** (port closed) |
-| `https://cortex.neoreef.com/webhooks/project-bridge/projects` (:443) | **404** |
-| `https://cortex.neoreef.com/api/webhooks/project-bridge/projects` | **404** |
-| other company/plugin-scoped path guesses | **404** |
+| `POST …/api/plugins/project-bridge/webhooks/zoho-projects` `{}` (unauth) | **200** `{"status":"success"}` (fail-open — no secret set yet) |
+| same with a realistic task body (unauth) | **200** `{"status":"success","deliveryId":…}` |
+| `POST …/api/plugins/project-bridge/webhooks/oauth-callback` `{}` | **200** |
+| `POST …/api/plugins/project-bridge/webhooks/projects` (wrong key) | **404** `endpoint 'projects' is not declared` (proves plugin resolves) |
+| old `…/webhooks/project-bridge/projects` (wrong base, the historical probe) | **404** (route never existed) |
+| TLS cert validity (`curl ssl_verify`) | **0 = valid** (public CA cert; Zoho will accept) |
+| DNS | `cortex.neoreef.com` → `52.25.189.207` :443 → reverse proxy → server :3100 |
 
-The settings UI default OAuth callback `https://cortex.neoreef.com:8443`
-(`src/ui/index.tsx:209`) is **not** live. The plugin must first be installed /
-deployed so the platform mounts its webhook endpoints and assigns a public URL.
-That devops work is delegated to **@Gene** in **NEO-105** (child of NEO-104).
+A `200` on this route is only returned when the plugin is `ready`, declares the
+endpoint, holds `webhooks.receive`, and the worker's `handleWebhook` RPC
+succeeds (`plugins.ts:2510-2603`) — so it is positive proof the instance is live.
+The fail-open/enforced auth decision happens **inside the worker**
+(`src/modules/sync/webhook-auth.ts`); `success` with no secret configured = the
+documented fail-open posture.
 
-Once NEO-105 returns the public base URL, still confirm:
+OAuth callback URL (for §2 redirect-URI registration), same scheme:
 
-1. **Port.** Zoho Projects workflow webhooks should target `:443`; if the host
-   only serves a non-standard port, front it with a 443 reverse proxy.
-2. **Callback path mismatch.** UI default path is `/oauth/callback`, but the
-   manifest endpoint is `/webhooks/project-bridge/oauth-callback` (`src/manifest.ts:108-112`).
-   Whatever the reverse proxy serves, the **inbound projects webhook** lives at
-   the manifest path below — verify it is reachable.
+```
+https://cortex.neoreef.com/api/plugins/project-bridge/webhooks/oauth-callback
+```
 
 ### 7.3 Exact Zoho workflow-webhook configuration
 
-Inbound endpoint (path is fixed by the manifest `projects` webhook key):
+Inbound endpoint (host route `+` manifest endpointKey value `zoho-projects`):
 
 ```
-POST https://<deployed-host>/webhooks/project-bridge/projects
+POST https://cortex.neoreef.com/api/plugins/project-bridge/webhooks/zoho-projects
 ```
 
 In portal `neoreef` (`60418044`) → Project `PR-90` → **Workflow Rules / Webhooks**,
@@ -285,9 +305,12 @@ Set the **same** value in two places so auth runs ENFORCED (not fail-open):
 
 Ordered; each step unblocks the next.
 
-1. [ ] **Deploy + publicly expose the instance** and report the public webhook URL
-       (§7.2). Owner: **@Gene (devops)** → tracked in **NEO-105** (blocks NEO-104).
-2. [ ] **Set `webhookSecret`** (§7.4) once the instance is up. Owner: **@Werner**.
+1. [x] **Deploy + publicly expose the instance** and report the public webhook URL
+       (§7.2). Owner: **@Gene (devops)** → **NEO-105 DONE 2026-06-12**: instance was
+       already installed/`ready` & publicly reachable; the blocker was a wrong URL.
+       Live URL: `https://cortex.neoreef.com/api/plugins/project-bridge/webhooks/zoho-projects`.
+2. [ ] **Set `webhookSecret`** (§7.4) — instance is up, so this is unblocked now.
+       Owner: **@Werner**.
 3. [ ] **Configure the Zoho `PR-90` workflow webhook** (§7.3) to POST to the URL
        with `X-Bridge-Webhook-Secret`. Owner: **@Werner**, exhausting the Zoho
        Projects API / plugin-OAuth path first (the plugin client holds
