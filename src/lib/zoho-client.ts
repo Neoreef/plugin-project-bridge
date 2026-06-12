@@ -48,8 +48,8 @@ type ServiceOAuthConfig = {
   dataCenter?: DataCenterKey;
 };
 
-/** Resolved auth plus the service it belongs to (null for the legacy global slot). */
-type ResolvedAuth = { auth: ZohoAuthState; serviceId: string | null };
+/** Resolved auth plus the service it belongs to. */
+type ResolvedAuth = { auth: ZohoAuthState; serviceId: string };
 
 function serviceConfigKey(serviceId: string): string {
   return `bridge.service.${serviceId}.config`;
@@ -60,11 +60,8 @@ function serviceAuthKey(serviceId: string): string {
 }
 
 async function getAuth(ctx: PluginContext): Promise<ResolvedAuth> {
-  // Check global auth first (legacy: seeded via `seed-auth`, pre-per-service installs)
-  const global = (await ctx.state.get({ scopeKind: "instance", stateKey: "zoho.auth" })) as ZohoAuthState | null;
-  if (global?.refreshToken) return { auth: global, serviceId: null };
-
-  // Check per-service auth (current pattern)
+  // Per-service auth is the single source of truth. Any legacy global
+  // `zoho.auth` blob is migrated into a per-service slot at plugin setup.
   const services = ((await ctx.state.get({ scopeKind: "instance", stateKey: "bridge.services" })) as Array<{ id: string }> | null) ?? [];
   for (const svc of services) {
     const auth = (await ctx.state.get({ scopeKind: "instance", stateKey: serviceAuthKey(svc.id) })) as ZohoAuthState | null;
@@ -78,27 +75,25 @@ async function getAuth(ctx: PluginContext): Promise<ResolvedAuth> {
  * Resolve OAuth credentials from per-service state — the single source of truth.
  * Credentials live in `bridge.service.{id}.config`, NOT in the manifest
  * `instanceConfigSchema` (the manifest credential fields were removed in NEO-89).
- * For the legacy global auth slot (no serviceId) we fall back to the first
- * service that has credentials configured, so token refresh works regardless of
- * the manifest top-level config.
+ * We prefer the credentials of the service the tokens belong to, falling back to
+ * any other service with credentials configured (e.g. a migrated legacy install
+ * whose tokens landed on a service that has no credentials of its own).
  */
 async function getOAuthCredentials(
   ctx: PluginContext,
-  serviceId: string | null,
+  serviceId: string,
 ): Promise<{ clientId: string; clientSecret: string }> {
-  if (serviceId) {
-    const cfg = (await ctx.state.get({ scopeKind: "instance", stateKey: serviceConfigKey(serviceId) })) as ServiceOAuthConfig | null;
-    if (cfg?.clientId && cfg?.clientSecret) {
-      return { clientId: cfg.clientId, clientSecret: cfg.clientSecret };
-    }
+  const cfg = (await ctx.state.get({ scopeKind: "instance", stateKey: serviceConfigKey(serviceId) })) as ServiceOAuthConfig | null;
+  if (cfg?.clientId && cfg?.clientSecret) {
+    return { clientId: cfg.clientId, clientSecret: cfg.clientSecret };
   }
 
-  // Legacy global auth: find any service that has credentials configured.
+  // Fall back to any service that has credentials configured.
   const services = ((await ctx.state.get({ scopeKind: "instance", stateKey: "bridge.services" })) as Array<{ id: string }> | null) ?? [];
   for (const svc of services) {
-    const cfg = (await ctx.state.get({ scopeKind: "instance", stateKey: serviceConfigKey(svc.id) })) as ServiceOAuthConfig | null;
-    if (cfg?.clientId && cfg?.clientSecret) {
-      return { clientId: cfg.clientId, clientSecret: cfg.clientSecret };
+    const other = (await ctx.state.get({ scopeKind: "instance", stateKey: serviceConfigKey(svc.id) })) as ServiceOAuthConfig | null;
+    if (other?.clientId && other?.clientSecret) {
+      return { clientId: other.clientId, clientSecret: other.clientSecret };
     }
   }
 
@@ -106,10 +101,9 @@ async function getOAuthCredentials(
 }
 
 async function saveAuth(ctx: PluginContext, resolved: ResolvedAuth): Promise<void> {
-  // Persist refreshed tokens back to the same slot they were read from, so each
-  // service keeps its own tokens isolated.
-  const stateKey = resolved.serviceId ? serviceAuthKey(resolved.serviceId) : "zoho.auth";
-  await ctx.state.set({ scopeKind: "instance", stateKey }, resolved.auth);
+  // Persist refreshed tokens back to the service slot they were read from, so
+  // each service keeps its own tokens isolated.
+  await ctx.state.set({ scopeKind: "instance", stateKey: serviceAuthKey(resolved.serviceId) }, resolved.auth);
 }
 
 async function refreshAccessToken(ctx: PluginContext, resolved?: ResolvedAuth): Promise<string> {

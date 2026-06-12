@@ -195,7 +195,7 @@ function Autocomplete({
 
 // ─── OAuth Setup Component (reusable per service) ───────────────────────────
 
-type ServiceOAuthConfig = { clientId?: string; clientSecret?: string; callbackUrl?: string; dataCenter?: string };
+type ServiceOAuthConfig = { clientId?: string; clientSecret?: string; callbackUrl?: string; dataCenter?: string; webhookSecret?: string };
 
 function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: ServiceDef }) {
   const { data: status, refresh } = usePluginData<ConnectionStatus>("connection-status", { serviceId });
@@ -208,6 +208,7 @@ function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: 
   const [clientSecret, setClientSecret] = useState("");
   const [callbackUrl, setCallbackUrl] = useState("https://cortex.neoreef.com:8443/oauth/callback");
   const [dataCenter, setDataCenter] = useState("US");
+  const [webhookSecret, setWebhookSecret] = useState("");
   const [configSaved, setConfigSaved] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -220,6 +221,7 @@ function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: 
       if (savedConfig.clientSecret) setClientSecret(savedConfig.clientSecret);
       if (savedConfig.callbackUrl) setCallbackUrl(savedConfig.callbackUrl);
       if (savedConfig.dataCenter) setDataCenter(savedConfig.dataCenter);
+      if (savedConfig.webhookSecret) setWebhookSecret(savedConfig.webhookSecret);
       if (savedConfig.clientId) setConfigSaved(true);
     }
   }, [savedConfig]);
@@ -240,7 +242,7 @@ function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: 
     if (!clientId) return;
     setSaving(true);
     try {
-      await saveOAuthConfig({ serviceId, clientId, clientSecret, callbackUrl, dataCenter });
+      await saveOAuthConfig({ serviceId, clientId, clientSecret, callbackUrl, dataCenter, webhookSecret });
       setConfigSaved(true);
       // Refresh connect URL after state propagates
       setTimeout(() => { refresh(); refreshConnectUrl(); }, 500);
@@ -249,7 +251,7 @@ function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: 
     } finally {
       setSaving(false);
     }
-  }, [serviceId, clientId, clientSecret, callbackUrl, dataCenter, saveOAuthConfig, refresh, refreshConnectUrl]);
+  }, [serviceId, clientId, clientSecret, callbackUrl, dataCenter, webhookSecret, saveOAuthConfig, refresh, refreshConnectUrl]);
 
   const handleDisconnect = useCallback(async () => {
     if (confirm("Disconnect this service? You will need to re-authenticate.")) {
@@ -281,6 +283,16 @@ function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: 
           )}
           <button type="button" style={btnDanger} onClick={handleDisconnect}>Disconnect</button>
         </div>
+        <div style={{ ...row, marginTop: "0.75rem" }}>
+          <label style={{ width: 110, fontSize: "12px", flexShrink: 0 }}>Webhook Secret</label>
+          <input style={inputStyle} type="password" value={webhookSecret} onChange={(e) => { setWebhookSecret(e.target.value); setConfigSaved(false); }} placeholder="Shared secret for inbound webhooks" />
+          <button type="button" style={btn} onClick={handleSaveConfig} disabled={!clientId || saving}>
+            {saving ? "Saving..." : configSaved ? "Saved" : "Save"}
+          </button>
+        </div>
+        <p style={{ ...muted, margin: "0.25rem 0 0 110px", fontSize: "11px" }}>
+          Authenticates inbound webhooks. Set the same value in the Zoho workflow webhook (header <code>X-Webhook-Secret</code>, a <code>webhookSecret</code> field, or an <code>X-Webhook-Signature</code> HMAC). When set, unauthenticated calls are rejected.
+        </p>
       </div>
     );
   }
@@ -310,6 +322,13 @@ function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: 
             </select>
           </div>
         )}
+        <div style={row}>
+          <label style={{ width: 110, fontSize: "12px", flexShrink: 0 }}>Webhook Secret</label>
+          <input style={inputStyle} type="password" value={webhookSecret} onChange={(e) => { setWebhookSecret(e.target.value); setConfigSaved(false); }} placeholder="Shared secret for inbound webhooks" />
+        </div>
+        <p style={{ ...muted, margin: "0 0 0 110px", fontSize: "11px" }}>
+          Set the same value in the Zoho workflow webhook — as header <code>X-Webhook-Secret</code>, a <code>webhookSecret</code> body/URL field, or an <code>X-Webhook-Signature</code> HMAC-SHA256 of the payload. When set, unauthenticated webhook calls are rejected.
+        </p>
       </div>
       <div style={btnGroup}>
         {!configSaved ? (

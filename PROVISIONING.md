@@ -195,3 +195,90 @@ OAuth connect → token refresh → inbound create/update (task in `PR-90` →
 Paperclip issue) → outbound status (Paperclip → Zoho task) → webhook auth
 rejection of unauthenticated calls → no sync loops. All writes stay inside
 `PR-90` via the allowlist.
+
+---
+
+## 7. Inbound webhook — turnkey config & verified findings (NEO-104)
+
+Scope: stand up the **inbound** Zoho→Paperclip path (the only remaining gap for
+NEO-93). This is operator/ops + Zoho-portal-browser work that cannot be executed
+from a coding-agent workspace; the agent-doable parts (contract verification +
+code hardening) are done and noted below.
+
+### 7.1 Verified on 2026-06-12 (agent, read-only)
+
+- **Plugin uses the classic `restapi` base**, not v3 — `getBaseUrl` returns
+  `https://projectsapi.zoho.com/restapi` (`src/lib/zoho-client.ts:28`), so the
+  group lookup hits `/restapi/portal/{portalId}/projects/{id}/`.
+- **Group shape (contract risk #1) — RESOLVED IN CODE.** The live v3 API returns
+  PR-90's group as `project_group.name = "Ungrouped Projects"` (confirmed via the
+  read-only Projects MCP). The classic `restapi` response shape could not be read
+  from the workspace (no token), so `fetchProjectGroupName` now reads **both**
+  shapes — `group_name` / `GROUP_NAME` / `group.name` **and** `project_group.name`
+  (`projects-handler.ts`, covered by a new test). Group→company resolution now
+  survives whichever shape the live classic API returns. **No P1.9 blocker here.**
+- **Group→company for PR-90:** group is `Ungrouped Projects`, which won't match a
+  Paperclip company name. For the test, either run the instance with **exactly one
+  company** (single-company fallback, `projects-handler.ts:273-277`) or add a group
+  mapping `Ungrouped Projects → <test company>` in settings.
+
+### 7.2 Deploy host (needs operator confirmation)
+
+The settings UI defaults the OAuth callback to **`https://cortex.neoreef.com:8443`**
+(`src/ui/index.tsx:209`) — the intended deploy host. Since OAuth is already
+connected (Zoho redirected back successfully), this host is the working target.
+**Two things for the operator to confirm — they are NOT verifiable from the agent
+workspace** (`cortex.neoreef.com:8443` does not resolve from the sandbox; that is
+inconclusive, not proof either way):
+
+1. **Port `:8443` (non-standard).** Confirm Zoho Projects workflow webhooks can
+   POST to a non-443 port. If not, expose the instance on `:443` (or front it with
+   a 443 reverse proxy) and use that URL.
+2. **Callback path mismatch.** UI default path is `/oauth/callback`, but the
+   manifest endpoint is `/webhooks/project-bridge/oauth-callback` (`src/manifest.ts:108-112`).
+   Whatever the reverse proxy actually serves, the **inbound projects webhook**
+   lives at the manifest path below — verify it is reachable.
+
+### 7.3 Exact Zoho workflow-webhook configuration
+
+Inbound endpoint (path is fixed by the manifest `projects` webhook key):
+
+```
+POST https://<deployed-host>/webhooks/project-bridge/projects
+```
+
+In portal `neoreef` (`60418044`) → Project `PR-90` → **Workflow Rules / Webhooks**,
+on Task **create** and **update**:
+
+- **Method:** `POST`
+- **URL:** the URL above
+- **Auth header (preferred):** `X-Bridge-Webhook-Secret: <SECRET>`
+  (also accepted: `X-Webhook-Secret`, `X-Webhook-Token`, `X-Zoho-Webhook-Token`;
+  or an HMAC over the raw body in `X-Bridge-Signature: sha256=<hex>`)
+  — header list authoritative in `src/modules/sync/webhook-auth.ts:30-47`.
+- **Body:** the task payload (the handler normalizes Zoho task fields → id, name,
+  status, priority, project id; `normalizeProjectsPayload`).
+
+### 7.4 The shared secret
+
+Generate a strong secret (do **NOT** commit it or paste it in an issue comment):
+
+```bash
+openssl rand -hex 32
+```
+
+Set the **same** value in two places so auth runs ENFORCED (not fail-open):
+1. Deployed instance setting `webhookSecret` (instance config) or per-service.
+2. The Zoho webhook header `X-Bridge-Webhook-Secret`.
+
+### 7.5 Remaining external blockers (cannot be done from the agent workspace)
+
+- [ ] **Confirm public reachability** of `https://<host>/webhooks/project-bridge/projects`
+      over HTTPS from the public internet (port/proxy per §7.2). Owner: **ops / @Gene**.
+- [ ] **Configure the Zoho workflow webhook** (§7.3) scoped to `PR-90`. Owner:
+      **NeoReef Zoho portal admin** (`bernesto@neoreef.com`).
+- [ ] **Set `webhookSecret`** (§7.4) in the deployed instance settings UI. Owner:
+      **operator / @Werner**.
+
+When all three land, post a task into `PR-90` — it should reach the endpoint, pass
+auth, and create the mapped Paperclip issue; NEO-93 then auto-resumes for §6 sign-off.

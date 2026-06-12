@@ -179,6 +179,28 @@ export function normalizeProjectsPayload(raw: Record<string, unknown>): Normaliz
   };
 }
 
+/**
+ * Parse the configured project allowlist (comma/space/newline-separated ids).
+ * Empty / unset → empty set, which the caller treats as "allow all".
+ */
+export function parseAllowedProjectIds(raw: string | undefined | null): Set<string> {
+  if (!raw) return new Set();
+  return new Set(
+    raw
+      .split(/[\s,]+/)
+      .map((id) => id.trim())
+      .filter(Boolean),
+  );
+}
+
+/**
+ * Whether a Zoho project is allowed to sync given the configured allowlist.
+ * An empty allowlist allows every (mapped) project — backward-compatible default.
+ */
+export function isProjectAllowed(projectId: string, allowed: Set<string>): boolean {
+  return allowed.size === 0 || allowed.has(projectId);
+}
+
 function mapPriority(zohoPriority: string | undefined): "low" | "medium" | "high" | "critical" {
   if (!zohoPriority) return "low";
   return (PRIORITY_MAP[zohoPriority.toLowerCase()] ?? "low") as "low" | "medium" | "high" | "critical";
@@ -217,7 +239,7 @@ async function getGroupMappings(ctx: PluginContext): Promise<GroupMappingEntry[]
  * 2. If no group mapping configured, try matching group name to Paperclip company name
  * 3. Fall back to single company if only one exists
  */
-async function resolveCompanyId(
+export async function resolveCompanyId(
   ctx: PluginContext,
   zohoProjectId: string,
 ): Promise<string | null> {
@@ -285,11 +307,18 @@ async function fetchProjectGroupName(ctx: PluginContext, zohoProjectId: string):
     const project = projects[0];
     if (!project) return null;
 
-    // Try known field names for project group
+    // Try known field names for project group. The classic `restapi` response
+    // historically exposes `group_name`/`GROUP_NAME`/`group.name`, but Zoho has
+    // been converging the classic and v3 APIs — v3 nests the group under
+    // `project_group.name` (verified live for PR-90 on 2026-06-12, NEO-104). Read
+    // every known shape so group→company resolution survives either response.
+    const projectGroup = project.project_group as Record<string, string> | undefined;
     const groupName =
       (project.group_name as string) ??
       (project.GROUP_NAME as string) ??
       ((project.group as Record<string, string>)?.name) ??
+      projectGroup?.name ??
+      projectGroup?.GROUP_NAME ??
       null;
 
     return groupName || null;
@@ -368,6 +397,20 @@ export async function handleProjectsWebhook(
 
   if (!normalized.taskId) {
     ctx.logger.debug("Zoho Projects webhook has no task id — ignoring");
+    return;
+  }
+
+  // ─── Project allowlist: bound writes to explicitly-permitted projects ───────
+  // When pointed at a live/production portal (no sandbox available) the operator
+  // can list a dedicated test project's id here; the plugin then refuses to act
+  // on any other project so real production tasks are never mirrored or mutated.
+  // An empty allowlist preserves the prior "all mapped projects" behavior.
+  const allowConfig = (await ctx.config.get()) as { allowedProjectIds?: string };
+  const allowed = parseAllowedProjectIds(allowConfig.allowedProjectIds);
+  if (!isProjectAllowed(normalized.projectId, allowed)) {
+    ctx.logger.info(
+      `Zoho project ${normalized.projectId} is not in the configured allowlist (${[...allowed].join(", ")}) — ignoring task ${normalized.taskId}`,
+    );
     return;
   }
 

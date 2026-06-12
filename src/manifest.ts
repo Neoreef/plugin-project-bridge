@@ -74,6 +74,12 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "string",
         title: "Zoho Projects Portal ID",
       },
+      allowedProjectIds: {
+        type: "string",
+        title: "Allowed Zoho Project IDs (allowlist)",
+        description:
+          "Comma-separated Zoho project IDs the plugin may sync. When set, inbound webhooks for any other project are ignored. Leave blank to allow all mapped projects. Use this to bound writes to a dedicated test project when running against a live/production portal.",
+      },
       deskOrgId: {
         type: "string",
         title: "Zoho Desk Organization ID",

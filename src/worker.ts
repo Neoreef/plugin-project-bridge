@@ -19,6 +19,7 @@ import { proactiveTokenRefresh, projectsFetch, zohoFetch } from "./lib/zoho-clie
 import { handleAgentEvent } from "./modules/provisioner/hermes-home.js";
 import { handleIssueUpdated } from "./modules/sync/outbound-sync.js";
 import { handleProjectsWebhook } from "./modules/sync/projects-handler.js";
+import { verifyWebhookAuth } from "./modules/sync/webhook-auth.js";
 import type { DataCenterKey } from "./constants.js";
 import { DATA_CENTERS } from "./constants.js";
 
@@ -39,6 +40,8 @@ type ServiceOAuthConfig = {
   clientSecret: string;
   callbackUrl: string;
   dataCenter: DataCenterKey;
+  /** Shared secret used to authenticate inbound webhooks for this service. */
+  webhookSecret?: string;
 };
 
 async function getServiceAuth(ctx: PluginContext, serviceId: string): Promise<ZohoAuthState | null> {
@@ -112,12 +115,36 @@ async function handleOAuthCallback(ctx: PluginContext, input: PluginWebhookInput
   ctx.logger.info(`OAuth completed for service ${serviceId} (${dc})`);
 }
 
-// Legacy: global auth state (reads from first connected service)
+/**
+ * Authenticate an inbound Zoho webhook before any issue mutation.
+ * Returns true if the request may proceed. Rejected requests are logged and
+ * dropped (no issue is created or updated).
+ */
+async function authorizeInboundWebhook(ctx: PluginContext, input: PluginWebhookInput): Promise<boolean> {
+  const result = await verifyWebhookAuth(ctx, input);
+  if (!result.ok) {
+    ctx.logger.warn(
+      `Rejected unauthenticated ${input.endpointKey} webhook (request ${input.requestId}): ${result.reason}`,
+    );
+    return false;
+  }
+  if (result.method === "unconfigured") {
+    ctx.logger.warn(
+      `${input.endpointKey} webhook accepted WITHOUT authentication — no webhook secret is configured. ` +
+        `Set a Webhook Secret in plugin settings to reject unauthorized callers.`,
+    );
+  } else {
+    ctx.logger.debug(`Authenticated ${input.endpointKey} webhook via ${result.method}`);
+  }
+  return true;
+}
+
+/**
+ * Aggregate connection state across all services — used by the global health
+ * check and the no-serviceId connection-status handler. Returns the first
+ * connected service's auth, or null if nothing is connected.
+ */
 async function getAuthState(ctx: PluginContext): Promise<ZohoAuthState | null> {
-  // Check global first for backwards compat
-  const global = (await ctx.state.get({ scopeKind: "instance", stateKey: "zoho.auth" })) as ZohoAuthState | null;
-  if (global?.refreshToken) return global;
-  // Try per-service auth
   const services = ((await ctx.state.get({ scopeKind: "instance", stateKey: "bridge.services" })) as any[] | null) ?? [];
   for (const svc of services) {
     const auth = await getServiceAuth(ctx, svc.id);
@@ -126,9 +153,50 @@ async function getAuthState(ctx: PluginContext): Promise<ZohoAuthState | null> {
   return null;
 }
 
+/**
+ * One-time migration of the legacy global `zoho.auth` blob into the per-service
+ * auth model. Pre-per-service installs stored a single set of tokens under
+ * `zoho.auth`; the plugin now resolves auth exclusively per service. We move
+ * those tokens onto a service slot (preferring one that already has OAuth
+ * credentials, creating a default Projects service if none exist) and delete the
+ * global slot so no legacy read path remains.
+ */
+async function migrateGlobalAuth(ctx: PluginContext): Promise<void> {
+  const global = (await ctx.state.get({ scopeKind: "instance", stateKey: "zoho.auth" })) as ZohoAuthState | null;
+  if (!global?.refreshToken) return;
+
+  let services = ((await ctx.state.get({ scopeKind: "instance", stateKey: "bridge.services" })) as any[] | null) ?? [];
+
+  // Prefer a service that already has OAuth credentials (so token refresh works);
+  // otherwise the first existing service; otherwise create a default one.
+  let targetId: string | undefined;
+  for (const svc of services) {
+    const cfg = await getServiceOAuthConfig(ctx, svc.id);
+    if (cfg?.clientId && cfg?.clientSecret) { targetId = svc.id; break; }
+  }
+  if (!targetId) targetId = services[0]?.id;
+  if (!targetId) {
+    targetId = `projects-${Date.now()}`;
+    services = [...services, { id: targetId, type: "projects", name: "Zoho Projects", enabled: true, createdAt: new Date().toISOString() }];
+    await ctx.state.set({ scopeKind: "instance", stateKey: "bridge.services" }, services);
+  }
+
+  // Never clobber a service that already has its own tokens.
+  const existing = await getServiceAuth(ctx, targetId);
+  if (!existing?.refreshToken) {
+    await ctx.state.set({ scopeKind: "instance", stateKey: serviceAuthKey(targetId) }, global);
+  }
+  await ctx.state.delete({ scopeKind: "instance", stateKey: "zoho.auth" });
+  ctx.logger.info(`Migrated legacy global zoho.auth into per-service slot ${targetId}`);
+}
+
 const plugin: PaperclipPlugin = definePlugin({
   async setup(ctx) {
     currentContext = ctx;
+
+    // ─── One-time auth migration ──────────────────────────────
+    // Collapse any legacy global `zoho.auth` into the per-service model.
+    await migrateGlobalAuth(ctx);
 
     // ─── Event Listeners ──────────────────────────────────────
     ctx.events.on("issue.updated", async (event) => {
@@ -401,6 +469,7 @@ const plugin: PaperclipPlugin = definePlugin({
         clientSecret: params.clientSecret as string ?? "",
         callbackUrl: params.callbackUrl as string ?? "",
         dataCenter: (params.dataCenter as DataCenterKey) ?? "US",
+        webhookSecret: (params.webhookSecret as string) ?? "",
       };
       await ctx.state.set({ scopeKind: "instance", stateKey: serviceConfigKey(serviceId) }, oauthConfig);
       return { ok: true };
@@ -463,41 +532,6 @@ const plugin: PaperclipPlugin = definePlugin({
       }
     });
 
-    // Legacy actions (still used by sync handlers internally)
-    ctx.actions.register("save-agent-mapping", async (params) => {
-      await ctx.state.set({ scopeKind: "instance", stateKey: "zoho.agentMapping" }, params.mapping);
-      return { ok: true };
-    });
-
-    ctx.actions.register("seed-auth", async (params) => {
-      const authState: ZohoAuthState = {
-        refreshToken: params.refreshToken as string,
-        accessToken: params.accessToken as string,
-        expiresAt: params.expiresAt as number,
-        dataCenter: (params.dataCenter as DataCenterKey) ?? "US",
-        connectedUser: params.connectedUser as string | undefined,
-      };
-      await ctx.state.set({ scopeKind: "instance", stateKey: "zoho.auth" }, authState);
-      ctx.logger.info("Auth state seeded via action");
-      return { ok: true };
-    });
-
-    ctx.actions.register("save-group-mapping", async (params) => {
-      await ctx.state.set({ scopeKind: "instance", stateKey: "zoho.groupMapping" }, params.mapping);
-      return { ok: true };
-    });
-
-    ctx.actions.register("save-project-mapping", async (params) => {
-      await ctx.state.set({ scopeKind: "instance", stateKey: "zoho.projectMapping" }, params.mapping);
-      return { ok: true };
-    });
-
-    ctx.actions.register("disconnect", async () => {
-      await ctx.state.delete({ scopeKind: "instance", stateKey: "zoho.auth" });
-      ctx.logger.info("Disconnected from Zoho");
-      return { ok: true };
-    });
-
     ctx.logger.info("Project Bridge plugin setup complete");
   },
 
@@ -539,6 +573,7 @@ const plugin: PaperclipPlugin = definePlugin({
           ctx.logger.info("Projects sync disabled, ignoring webhook");
           return;
         }
+        if (!(await authorizeInboundWebhook(ctx, input))) return;
         await handleProjectsWebhook(ctx, input.rawBody, input.parsedBody);
         break;
 
@@ -547,6 +582,7 @@ const plugin: PaperclipPlugin = definePlugin({
           ctx.logger.info("Desk sync disabled, ignoring webhook");
           return;
         }
+        if (!(await authorizeInboundWebhook(ctx, input))) return;
         ctx.logger.info("Desk webhook received — handler not yet implemented (Phase 2)");
         break;
 
