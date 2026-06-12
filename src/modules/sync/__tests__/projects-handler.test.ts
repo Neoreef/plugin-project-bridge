@@ -64,6 +64,36 @@ describe("projects-handler", () => {
       const result = normalizeProjectsPayload(raw);
       expect(result.assignedAgent).toBe("Bob");
     });
+
+    it("derives assignee from the task owner (client user) when no dropdown/tag", () => {
+      const v3 = normalizeProjectsPayload({
+        Task: { id: 1, name: "T", owners_and_work: { owners: [{ name: "Kelly", email: "kelly@x.com" }] } },
+        Project: { id: "p1" },
+      });
+      expect(v3.assignedAgent).toBe("Kelly");
+
+      const classic = normalizeProjectsPayload({ Task: { id: 2, name: "T", details: { owners: [{ name: "Ada" }] } } });
+      expect(classic.assignedAgent).toBe("Ada");
+    });
+
+    it("treats Zoho 'Unassigned User' owner as no assignee", () => {
+      const result = normalizeProjectsPayload({
+        Task: { id: 3, name: "T", owners_and_work: { owners: [{ name: "Unassigned User" }] } },
+      });
+      expect(result.assignedAgent).toBeUndefined();
+    });
+
+    it("prefers an explicit Assigned Agent over the owner", () => {
+      const result = normalizeProjectsPayload({
+        Task: {
+          id: 4,
+          name: "T",
+          custom_fields: [{ label_name: "Assigned Agent", value: "Werner" }],
+          owners_and_work: { owners: [{ name: "Brian Ernesto" }] },
+        },
+      });
+      expect(result.assignedAgent).toBe("Werner");
+    });
   });
 
   describe("resolveCompanyId", () => {

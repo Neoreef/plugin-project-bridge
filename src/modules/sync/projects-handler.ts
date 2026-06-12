@@ -81,6 +81,30 @@ function extractAgentTags(raw: Record<string, unknown>, taskTags?: string[]): { 
 }
 
 /**
+ * Extract the task owner's display name across known Zoho task shapes:
+ * v3 `owners_and_work.owners[]`, classic `details.owners[]`, or top-level
+ * `owner_name`. Returns "" when unassigned, and treats Zoho's "Unassigned User"
+ * placeholder as unassigned so it never masquerades as a real assignee.
+ */
+function extractOwnerName(task: Record<string, unknown>): string {
+  const firstOwnerName = (owners: unknown): string => {
+    if (Array.isArray(owners) && owners.length > 0) {
+      const name = (owners[0] as Record<string, unknown>)?.name;
+      return typeof name === "string" ? name.trim() : "";
+    }
+    return "";
+  };
+  const ow = task.owners_and_work as { owners?: unknown } | undefined;
+  let name = firstOwnerName(ow?.owners);
+  if (!name) {
+    const details = task.details as { owners?: unknown } | undefined;
+    name = firstOwnerName(details?.owners);
+  }
+  if (!name && typeof task.owner_name === "string") name = (task.owner_name as string).trim();
+  return name === "Unassigned User" ? "" : name;
+}
+
+/**
  * Normalize a Zoho Projects webhook payload into a standard task structure.
  */
 export function normalizeProjectsPayload(raw: Record<string, unknown>): NormalizedProjectsTask {
@@ -112,6 +136,13 @@ export function normalizeProjectsPayload(raw: Record<string, unknown>): Normaliz
   }
   if (!assignedAgent) {
     assignedAgent = (raw.assignedAgent as string) ?? "";
+  }
+  // Owner (client user) — the current Zoho model assigns work to client users
+  // rather than the legacy "Assigned Agent" dropdown. Read the task owner's
+  // display name across the known v3 (`owners_and_work.owners`) and classic
+  // (`details.owners` / `owner_name`) shapes so a fetched task self-resolves.
+  if (!assignedAgent) {
+    assignedAgent = extractOwnerName(task);
   }
 
   // Tags
