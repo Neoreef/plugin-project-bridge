@@ -222,22 +222,32 @@ code hardening) are done and noted below.
   company** (single-company fallback, `projects-handler.ts:273-277`) or add a group
   mapping `Ungrouped Projects → <test company>` in settings.
 
-### 7.2 Deploy host (needs operator confirmation)
+### 7.2 Deploy host — NO REACHABLE INSTANCE TODAY (probed 2026-06-12, Werner)
 
-The settings UI defaults the OAuth callback to **`https://cortex.neoreef.com:8443`**
-(`src/ui/index.tsx:209`) — the intended deploy host. Since OAuth is already
-connected (Zoho redirected back successfully), this host is the working target.
-**Two things for the operator to confirm — they are NOT verifiable from the agent
-workspace** (`cortex.neoreef.com:8443` does not resolve from the sandbox; that is
-inconclusive, not proof either way):
+Active probing on **2026-06-12** disproves the earlier assumption that
+`cortex.neoreef.com:8443` is a working deploy target. There is **no publicly
+reachable Project Bridge instance** right now:
 
-1. **Port `:8443` (non-standard).** Confirm Zoho Projects workflow webhooks can
-   POST to a non-443 port. If not, expose the instance on `:443` (or front it with
-   a 443 reverse proxy) and use that URL.
+| Probe (`POST … {}`) | Result |
+| --- | --- |
+| `https://cortex.neoreef.com:8443/webhooks/project-bridge/projects` | **connection refused** (port closed) |
+| `https://cortex.neoreef.com/webhooks/project-bridge/projects` (:443) | **404** |
+| `https://cortex.neoreef.com/api/webhooks/project-bridge/projects` | **404** |
+| other company/plugin-scoped path guesses | **404** |
+
+The settings UI default OAuth callback `https://cortex.neoreef.com:8443`
+(`src/ui/index.tsx:209`) is **not** live. The plugin must first be installed /
+deployed so the platform mounts its webhook endpoints and assigns a public URL.
+That devops work is delegated to **@Gene** in **NEO-105** (child of NEO-104).
+
+Once NEO-105 returns the public base URL, still confirm:
+
+1. **Port.** Zoho Projects workflow webhooks should target `:443`; if the host
+   only serves a non-standard port, front it with a 443 reverse proxy.
 2. **Callback path mismatch.** UI default path is `/oauth/callback`, but the
    manifest endpoint is `/webhooks/project-bridge/oauth-callback` (`src/manifest.ts:108-112`).
-   Whatever the reverse proxy actually serves, the **inbound projects webhook**
-   lives at the manifest path below — verify it is reachable.
+   Whatever the reverse proxy serves, the **inbound projects webhook** lives at
+   the manifest path below — verify it is reachable.
 
 ### 7.3 Exact Zoho workflow-webhook configuration
 
@@ -271,14 +281,17 @@ Set the **same** value in two places so auth runs ENFORCED (not fail-open):
 1. Deployed instance setting `webhookSecret` (instance config) or per-service.
 2. The Zoho webhook header `X-Bridge-Webhook-Secret`.
 
-### 7.5 Remaining external blockers (cannot be done from the agent workspace)
+### 7.5 Remaining work — owners & sequencing (updated 2026-06-12)
 
-- [ ] **Confirm public reachability** of `https://<host>/webhooks/project-bridge/projects`
-      over HTTPS from the public internet (port/proxy per §7.2). Owner: **ops / @Gene**.
-- [ ] **Configure the Zoho workflow webhook** (§7.3) scoped to `PR-90`. Owner:
-      **NeoReef Zoho portal admin** (`bernesto@neoreef.com`).
-- [ ] **Set `webhookSecret`** (§7.4) in the deployed instance settings UI. Owner:
-      **operator / @Werner**.
+Ordered; each step unblocks the next.
 
-When all three land, post a task into `PR-90` — it should reach the endpoint, pass
-auth, and create the mapped Paperclip issue; NEO-93 then auto-resumes for §6 sign-off.
+1. [ ] **Deploy + publicly expose the instance** and report the public webhook URL
+       (§7.2). Owner: **@Gene (devops)** → tracked in **NEO-105** (blocks NEO-104).
+2. [ ] **Set `webhookSecret`** (§7.4) once the instance is up. Owner: **@Werner**.
+3. [ ] **Configure the Zoho `PR-90` workflow webhook** (§7.3) to POST to the URL
+       with `X-Bridge-Webhook-Secret`. Owner: **@Werner**, exhausting the Zoho
+       Projects API / plugin-OAuth path first (the plugin client holds
+       `ZohoProjects.projects.ALL`); a human portal admin is the fallback **only**
+       if Zoho exposes no programmatic webhook-config path.
+4. [ ] **End-to-end test**: create/update a task in `PR-90` → endpoint → auth →
+       mapped Paperclip issue. Then NEO-93 auto-resumes for §6 sign-off.
