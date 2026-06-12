@@ -4,6 +4,8 @@ import {
   resolveCompanyId,
   parseAllowedProjectIds,
   isProjectAllowed,
+  findThinTaskRef,
+  hydrateInboundPayload,
 } from "../projects-handler.js";
 import { projectsFetch } from "../../../lib/zoho-client.js";
 
@@ -145,6 +147,71 @@ describe("projects-handler", () => {
       expect(isProjectAllowed("test-proj-1", allowed)).toBe(true);
       expect(isProjectAllowed("test-proj-2", allowed)).toBe(true);
       expect(isProjectAllowed("prod-proj-99", allowed)).toBe(false);
+    });
+  });
+
+  describe("findThinTaskRef", () => {
+    it("extracts ids from a thin notification (snake or camel)", () => {
+      expect(findThinTaskRef({ type: "task", taskId: "t1", projectId: "p1" })).toEqual({ taskId: "t1", projectId: "p1" });
+      expect(findThinTaskRef({ task_id: "t2", project_id: "p2" })).toEqual({ taskId: "t2", projectId: "p2" });
+      expect(findThinTaskRef({ id: 99, Project: { id: "p3" } })).toEqual({ taskId: "99", projectId: "p3" });
+    });
+
+    it("returns null when ids are missing", () => {
+      expect(findThinTaskRef({ type: "project", projectId: "p1" })).toBeNull();
+      expect(findThinTaskRef({ taskId: "t1" })).toBeNull();
+    });
+  });
+
+  describe("hydrateInboundPayload", () => {
+    const ctxWith = (portalId?: string) => ({
+      config: { get: async () => ({ portalId }) },
+      logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+    }) as any;
+
+    it("passes a full inline-task payload through unchanged (no fetch)", async () => {
+      const raw = { Task: { id: 1, name: "Inline", status: { name: "open" } }, Project: { id: "p1" } };
+      const out = await hydrateInboundPayload(ctxWith("portal-1"), raw);
+      expect(out).toBe(raw);
+      expect(projectsFetch).not.toHaveBeenCalled();
+    });
+
+    it("fetches the task from the Zoho API for a thin ping and wraps it", async () => {
+      (projectsFetch as any).mockResolvedValueOnce({
+        ok: true,
+        data: { tasks: [{ id: "t9", name: "Fetched Task", status: { name: "open", type: "open" }, priority: "high" }] },
+      });
+      const out = await hydrateInboundPayload(ctxWith("portal-1"), { type: "task", taskId: "t9", projectId: "p9" });
+      expect(projectsFetch).toHaveBeenCalledWith(
+        expect.anything(),
+        "GET",
+        expect.stringContaining("/portal/portal-1/projects/p9/tasks/t9/"),
+      );
+      const normalized = normalizeProjectsPayload(out);
+      expect(normalized.taskId).toBe("t9");
+      expect(normalized.taskName).toBe("Fetched Task");
+      expect(normalized.projectId).toBe("p9");
+      expect(normalized.priority).toBe("high");
+    });
+
+    it("uses portalId from the ping over config when provided", async () => {
+      (projectsFetch as any).mockResolvedValueOnce({ ok: true, data: { tasks: [{ id: "t1", name: "X" }] } });
+      await hydrateInboundPayload(ctxWith("config-portal"), { taskId: "t1", projectId: "p1", portalId: "ping-portal" });
+      expect(projectsFetch).toHaveBeenCalledWith(expect.anything(), "GET", expect.stringContaining("/portal/ping-portal/"));
+    });
+
+    it("leaves non-task pings (e.g. project) untouched", async () => {
+      const raw = { type: "project", projectId: "p1" };
+      const out = await hydrateInboundPayload(ctxWith("portal-1"), raw);
+      expect(out).toBe(raw);
+      expect(projectsFetch).not.toHaveBeenCalled();
+    });
+
+    it("falls back to the original payload when the fetch fails", async () => {
+      (projectsFetch as any).mockResolvedValueOnce({ ok: false, status: 404 });
+      const raw = { taskId: "t1", projectId: "p1" };
+      const out = await hydrateInboundPayload(ctxWith("portal-1"), raw);
+      expect(out).toBe(raw);
     });
   });
 });

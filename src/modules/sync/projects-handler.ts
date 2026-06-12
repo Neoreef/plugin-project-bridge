@@ -381,6 +381,99 @@ async function autoLinkProject(
   }
 }
 
+// ─── Thin-ping hydration ─────────────────────────────────────────────────────
+// The Zoho workflow function can send either the full task payload OR a thin
+// "notification" — just the record type + id. The thin shape keeps the Deluge
+// trivial: it tells us *what changed* and we pull the authoritative record from
+// the Zoho API ourselves (we already hold an OAuth token for it). Backward
+// compatible: a payload that already carries an inline Task body is used as-is.
+
+function firstString(obj: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const k of keys) {
+    const v = obj[k];
+    if (typeof v === "string" && v.trim() !== "") return v.trim();
+    if (typeof v === "number") return String(v);
+  }
+  return undefined;
+}
+
+/** True when the payload already carries task content (full payload, not a ping). */
+function hasInlineTaskBody(raw: Record<string, unknown>): boolean {
+  const tw = (raw.Task ?? raw.task) as Record<string, unknown> | undefined;
+  if (!tw || typeof tw !== "object") return false;
+  const arr = (tw as { tasks?: unknown }).tasks;
+  const t = (Array.isArray(arr) && arr.length > 0 ? arr[0] : tw) as Record<string, unknown>;
+  return Boolean(t && (t.name ?? t.title ?? t.status ?? t.priority ?? t.description));
+}
+
+/** Pull {taskId, projectId} out of a thin notification payload, if present. */
+export function findThinTaskRef(raw: Record<string, unknown>): { taskId: string; projectId: string } | null {
+  const taskId = firstString(raw, ["taskId", "task_id", "taskid", "recordId", "id"]);
+  if (!taskId) return null;
+  const projectId =
+    firstString(raw, ["projectId", "project_id", "projectid"]) ??
+    firstString((raw.Project ?? raw.project ?? {}) as Record<string, unknown>, ["id", "PROJECTID"]);
+  if (!projectId) return null;
+  return { taskId, projectId };
+}
+
+async function fetchTaskById(
+  ctx: PluginContext,
+  portalId: string,
+  projectId: string,
+  taskId: string,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const res = await projectsFetch(ctx, "GET", `/portal/${portalId}/projects/${projectId}/tasks/${taskId}/`);
+    if (!res.ok) {
+      ctx.logger.warn(`Thin ping: failed to fetch task ${taskId} in project ${projectId}: ${res.status}`);
+      return null;
+    }
+    const data = res.data as Record<string, unknown>;
+    const tasks = (data.tasks ?? (data.task ? [data.task] : [data])) as Array<Record<string, unknown>>;
+    return tasks[0] ?? null;
+  } catch (error) {
+    ctx.logger.warn(`Thin ping: error fetching task ${taskId}: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
+/**
+ * Normalize an inbound payload to the full shape `normalizeProjectsPayload`
+ * expects. If the payload is already a full task body it is returned unchanged;
+ * if it is a thin `{type:"task", taskId, projectId}` ping, the task is fetched
+ * from the Zoho API and wrapped. Non-task pings (e.g. project/users) are left
+ * untouched and fall through to the existing "no task id" no-op.
+ */
+export async function hydrateInboundPayload(
+  ctx: PluginContext,
+  raw: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  if (hasInlineTaskBody(raw)) return raw;
+  const ref = findThinTaskRef(raw);
+  if (!ref) return raw;
+
+  const config = (await ctx.config.get()) as { portalId?: string };
+  const portalId = firstString(raw, ["portalId", "portal_id"]) ?? config.portalId;
+  if (!portalId) {
+    ctx.logger.warn(`Thin task ping for ${ref.taskId} but no portalId configured/provided — cannot hydrate`);
+    return raw;
+  }
+
+  const task = await fetchTaskById(ctx, portalId, ref.projectId, ref.taskId);
+  if (!task) return raw;
+
+  ctx.logger.info(`Hydrated thin task ping ${ref.taskId} (project ${ref.projectId}) from the Zoho API`);
+  const hydrated: Record<string, unknown> = {
+    Task: task,
+    Project: { id: ref.projectId },
+    source: "projects",
+  };
+  if (raw.assignedAgent) hydrated.assignedAgent = raw.assignedAgent;
+  if (raw.agentTags) hydrated.agentTags = raw.agentTags;
+  return hydrated;
+}
+
 // ─── Main handler ───────────────────────────────────────────────────────────
 
 /**
@@ -392,7 +485,7 @@ export async function handleProjectsWebhook(
   rawBody: string,
   parsedBody: unknown,
 ): Promise<void> {
-  const raw = parseWebhookBody(rawBody, parsedBody) as Record<string, unknown>;
+  const raw = await hydrateInboundPayload(ctx, parseWebhookBody(rawBody, parsedBody) as Record<string, unknown>);
   const normalized = normalizeProjectsPayload(raw);
 
   if (!normalized.taskId) {
