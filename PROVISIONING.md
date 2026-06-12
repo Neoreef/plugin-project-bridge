@@ -80,6 +80,18 @@ claude.ai MCP connection) at the Zoho API console for the **US** DC:
    `https://<deployed-plugin-host>/webhooks/project-bridge/oauth-callback`.
 3. Copy the generated **Client ID** and **Client Secret**.
 
+> **Received 2026-06-12 (Werner):** Client ID `1000.DQF76AHIV90K2IWXCWUQ4FN6W1Y08A`
+> (US DC `1000.` prefix — consistent with `dataCenter = US`). A client_id is a
+> public value (it travels in the browser authorize URL), so it is recorded here.
+> **Still outstanding for this deliverable:**
+> - **Client Secret** — sensitive. Do **NOT** paste it into an issue comment or
+>   commit it; enter it directly in the deployed plugin's settings UI
+>   (`bridge.service.{id}.config.clientSecret`, NEO-89). Without it,
+>   `getOAuthCredentials` throws and token refresh cannot run
+>   (`src/lib/zoho-client.ts:82-101,112-120`).
+> - **Authorized redirect URI** — cannot be registered against this client until
+>   the deploy host (step 3) is known; it must byte-match the plugin `callbackUrl`.
+
 ### Exact OAuth parameters the plugin uses (do not guess — from source)
 
 - **Authorize endpoint:** `https://accounts.zoho.com/oauth/v2/auth`
@@ -134,8 +146,28 @@ Set in plugin settings (manifest `instanceConfigSchema`, `src/manifest.ts:55-88`
 | `webhookSecret` (instance) | the secret from step 3 |
 
 Per-service OAuth config (settings UI → service connection):
-`clientId`, `clientSecret`, `callbackUrl` (= redirect URI), `dataCenter = US`.
+`clientId` (= `1000.DQF76AHIV90K2IWXCWUQ4FN6W1Y08A`, received 2026-06-12),
+`clientSecret`, `callbackUrl` (= redirect URI), `dataCenter = US`.
 Then click **Connect** to run OAuth and obtain the refresh token.
+
+---
+
+## Remaining to unblock NEO-93 (as of 2026-06-12)
+
+Deliverable #1 (sandbox isolation) is satisfied by config (`PR-90` allowlist).
+Deliverable #2 is **partially** in: Client ID received. Outstanding operator items —
+all require NeoReef Zoho admin / ops and cannot be done from the workspace:
+
+- [ ] **Client Secret** for client `1000.DQF76AHIV90K2IWXCWUQ4FN6W1Y08A` — enter
+      directly in the deployed plugin settings UI (do not post in plaintext).
+- [ ] **Deployed plugin instance** reachable by Zoho over HTTPS → yields the
+      public host for the redirect URI + webhook target (step 3).
+- [ ] **Authorized redirect URI** registered on the above client, byte-matching
+      the deployed plugin `callbackUrl` (step 2).
+- [ ] **Webhook shared secret** configured (instance `webhookSecret` or
+      per-service) and presented by the Zoho workflow webhook (step 3).
+
+Owner: **@Werner**. Once all four land, run the §6 P1.9 checklist for v1 sign-off.
 
 ---
 
