@@ -301,7 +301,7 @@ Set the **same** value in two places so auth runs ENFORCED (not fail-open):
 1. Deployed instance setting `webhookSecret` (instance config) or per-service.
 2. The Zoho webhook header `X-Bridge-Webhook-Secret`.
 
-### 7.5 Remaining work — owners & sequencing (updated 2026-06-12)
+### 7.5 Remaining work — owners & sequencing (updated 2026-06-12, run 5674a3c8)
 
 Ordered; each step unblocks the next.
 
@@ -309,12 +309,32 @@ Ordered; each step unblocks the next.
        (§7.2). Owner: **@Gene (devops)** → **NEO-105 DONE 2026-06-12**: instance was
        already installed/`ready` & publicly reachable; the blocker was a wrong URL.
        Live URL: `https://cortex.neoreef.com/api/plugins/project-bridge/webhooks/zoho-projects`.
-2. [ ] **Set `webhookSecret`** (§7.4) — instance is up, so this is unblocked now.
-       Owner: **@Werner**.
-3. [ ] **Configure the Zoho `PR-90` workflow webhook** (§7.3) to POST to the URL
-       with `X-Bridge-Webhook-Secret`. Owner: **@Werner**, exhausting the Zoho
-       Projects API / plugin-OAuth path first (the plugin client holds
-       `ZohoProjects.projects.ALL`); a human portal admin is the fallback **only**
-       if Zoho exposes no programmatic webhook-config path.
+       Re-verified live this run: `POST {}` → `200 {"status":"success","deliveryId":…}`
+       (fail-open, no secret set yet).
+2. [x] **Group→company contract (concrete-action #4)** — re-confirmed against the
+       **live** portal this run via read-only Projects MCP `get_project_detail`:
+       PR-90 returns its group as **`project_group.name = "Ungrouped Projects"`**
+       (v3 nesting; no top-level `group_name`). `fetchProjectGroupName`
+       (`projects-handler.ts:315-322`) already reads `project_group.name`, so
+       resolution survives this shape. Because the group is `Ungrouped Projects`
+       (won't name-match a Paperclip company), the deployed instance must EITHER run
+       with exactly one company (single-company fallback, `projects-handler.ts:273-277`)
+       OR have a `zoho.groupMapping` entry `Ungrouped Projects → <test company>`.
+3. [ ] **Set `webhookSecret` + configure the Zoho `PR-90` workflow webhook — BUNDLED**
+       (§7.3 + §7.4). These two MUST be done together by the operator, in this order,
+       because of a lock-out hazard: setting `webhookSecret` flips auth to **ENFORCED**,
+       after which any delivery WITHOUT the matching `X-Bridge-Webhook-Secret` header
+       (including the very test we want) is rejected. So: configure the Zoho workflow
+       webhook to send the header first (or simultaneously), then set the identical
+       secret on the instance. Owner: **@Werner / NeoReef Zoho admin (bernesto@neoreef.com)**.
+       - **No programmatic path exists for the Zoho side.** The plugin OAuth client
+         path was exhausted: the Zoho Projects MCP surface exposes no
+         webhook/workflow-rule tool, and Zoho Projects has no public REST endpoint to
+         create workflow business-rule webhooks — they are portal-admin **browser-UI**
+         only. So the human-portal-admin fallback (anticipated in §3) is now confirmed
+         REQUIRED, not optional.
+       - The agent also intentionally did **not** pre-set `webhookSecret` alone: doing
+         so before the Zoho header is in place would lock out all inbound deliveries.
 4. [ ] **End-to-end test**: create/update a task in `PR-90` → endpoint → auth →
-       mapped Paperclip issue. Then NEO-93 auto-resumes for §6 sign-off.
+       mapped Paperclip issue. Then NEO-93 auto-resumes for §6 sign-off. (Agent can
+       drive the `PR-90` task create via the Projects MCP once step 3's webhook is live.)
