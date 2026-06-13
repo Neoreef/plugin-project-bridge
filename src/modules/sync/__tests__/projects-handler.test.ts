@@ -6,6 +6,7 @@ import {
   isProjectAllowed,
   findThinTaskRef,
   hydrateInboundPayload,
+  handleProjectNotification,
 } from "../projects-handler.js";
 import { projectsFetch } from "../../../lib/zoho-client.js";
 
@@ -242,6 +243,37 @@ describe("projects-handler", () => {
       const raw = { taskId: "t1", projectId: "p1" };
       const out = await hydrateInboundPayload(ctxWith("portal-1"), raw);
       expect(out).toBe(raw);
+    });
+  });
+
+  describe("handleProjectNotification", () => {
+    const projCtx = (opts: { allowedProjectIds?: string; mappings?: any[]; portalId?: string } = {}) => ({
+      config: { get: async () => ({ allowedProjectIds: opts.allowedProjectIds, portalId: opts.portalId ?? "portal-1" }) },
+      state: {
+        get: async (k: any) => (k.stateKey === "zoho.projectMapping" ? opts.mappings ?? [] : []),
+        set: vi.fn(),
+      },
+      logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
+      projects: { list: vi.fn(async () => []) },
+      companies: { list: async () => [] },
+    }) as any;
+
+    it("is a no-op (no API call) when the project is already mapped", async () => {
+      const ctx = projCtx({ mappings: [{ zohoProjectId: "p1", paperclipProjectId: "x", paperclipCompanyId: "c" }] });
+      await handleProjectNotification(ctx, { type: "project", projectId: "p1", portalId: "portal-1" });
+      expect(projectsFetch).not.toHaveBeenCalled();
+    });
+
+    it("ignores a project that is not in the allowlist", async () => {
+      const ctx = projCtx({ allowedProjectIds: "other-proj" });
+      await handleProjectNotification(ctx, { type: "project", projectId: "p1", portalId: "portal-1" });
+      expect(projectsFetch).not.toHaveBeenCalled();
+    });
+
+    it("ignores a payload with no project id", async () => {
+      const ctx = projCtx();
+      await handleProjectNotification(ctx, { type: "project" });
+      expect(projectsFetch).not.toHaveBeenCalled();
     });
   });
 });

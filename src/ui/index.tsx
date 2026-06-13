@@ -293,6 +293,7 @@ function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: 
         <p style={{ ...muted, margin: "0.25rem 0 0 110px", fontSize: "11px" }}>
           Authenticates inbound webhooks. Set the same value in the Zoho workflow webhook (header <code>X-Webhook-Secret</code>, a <code>webhookSecret</code> field, or an <code>X-Webhook-Signature</code> HMAC). When set, unauthenticated calls are rejected.
         </p>
+        {serviceDef.provider === "zoho" && <ZohoProjectsSetup webhookSecret={webhookSecret} />}
       </div>
     );
   }
@@ -345,6 +346,108 @@ function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: 
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+// ─── Zoho Projects setup instructions (inbound workflow functions) ───────────
+
+const INBOUND_WEBHOOK_URL = "https://cortex.neoreef.com/api/plugins/project-bridge/webhooks/zoho-projects";
+
+function buildNotifierScript(kind: "task" | "project", secret: string): string {
+  const isTask = kind === "task";
+  const args = isTask
+    ? "// Arguments: portalId → Portal System ID, projectId → Project System ID, taskId → Task System ID"
+    : "// Arguments: portalId → Portal System ID, projectId → Project System ID   (no Task System ID)";
+  const taskLine = isTask ? '\npayload.put("taskId", taskId);' : "";
+  return `// Project Bridge — ${isTask ? "Task" : "Project"} notifier. ${isTask ? "TASK" : "PROJECT"} workflow rule (Create/Update).
+${args}
+payload = Map();
+payload.put("type", "${kind}");${taskLine}
+payload.put("projectId", projectId);
+payload.put("portalId", portalId);
+resp = invokeurl
+[
+\turl    : "${INBOUND_WEBHOOK_URL}"
+\ttype   : POST
+\tparameters : payload.toString()
+\theaders: {"X-Bridge-Webhook-Secret":"${secret}", "Content-Type":"application/json"}
+];
+return resp.toString();`;
+}
+
+const codeBlock: CSSProperties = {
+  background: "#1e1e1e",
+  color: "#d4d4d4",
+  padding: "8px 10px",
+  borderRadius: "4px",
+  overflowX: "auto",
+  fontSize: "11px",
+  lineHeight: 1.5,
+  whiteSpace: "pre",
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+  margin: "0.25rem 0 0",
+};
+
+function ScriptBlock({ title, script }: { title: string; script: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = useCallback(() => {
+    try {
+      navigator.clipboard?.writeText(script);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard unavailable */ }
+  }, [script]);
+  return (
+    <div style={{ marginTop: "0.5rem" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+        <strong style={{ fontSize: "12px" }}>{title}</strong>
+        <button type="button" style={{ ...btn, padding: "1px 8px", fontSize: "11px" }} onClick={copy}>
+          {copied ? "Copied ✓" : "Copy"}
+        </button>
+      </div>
+      <pre style={codeBlock}>{script}</pre>
+    </div>
+  );
+}
+
+function ZohoProjectsSetup({ webhookSecret }: { webhookSecret: string }) {
+  const [open, setOpen] = useState(false);
+  const secret = webhookSecret || "<set & save the Webhook Secret above first>";
+  return (
+    <div style={{ marginTop: "0.75rem" }}>
+      <button type="button" style={btn} onClick={() => setOpen((o) => !o)}>
+        {open ? "▾" : "▸"} Zoho Projects setup instructions
+      </button>
+      {open && (
+        <div style={{ ...section, marginTop: "0.5rem", fontSize: "12px" }}>
+          <p style={{ marginTop: 0 }}>
+            Inbound sync is driven by Zoho <strong>Workflow Rules</strong> that call a custom function on create/update.
+            The function just notifies Project Bridge with the record ids; the plugin fetches the full record from the Zoho API itself.
+          </p>
+          <ol style={{ margin: "0.25rem 0 0.5rem 1.1rem", padding: 0, lineHeight: 1.6 }}>
+            <li>In Zoho Projects: <strong>Setup → Automation → Workflow Rules → New Rule</strong>.</li>
+            <li>Record type <strong>Task</strong> (and a second rule for <strong>Project</strong> if you want project sync); trigger on <strong>Create</strong> and <strong>Edit/Update</strong>.</li>
+            <li>Action → <strong>Custom Function</strong> (Deluge). Paste the matching script below.</li>
+            <li>Map the function <strong>Arguments</strong> (Parameter Name → Value):
+              {" "}<code>portalId</code> → <code>Portal System ID</code>,
+              {" "}<code>projectId</code> → <code>Project System ID</code>
+              {", "}<code>taskId</code> → <code>Task System ID</code> (Task rule only).</li>
+            <li><strong>Save</strong>. The secret below is already filled in from your Webhook Secret.</li>
+          </ol>
+          <p style={{ ...muted, fontSize: "11px", margin: "0.25rem 0" }}>
+            Endpoint: <code>{INBOUND_WEBHOOK_URL}</code>
+          </p>
+          <ScriptBlock title="Task notifier (Portal + Project + Task System ID)" script={buildNotifierScript("task", secret)} />
+          <ScriptBlock title="Project notifier (Portal + Project System ID only)" script={buildNotifierScript("project", secret)} />
+          <p style={{ ...muted, fontSize: "11px", margin: "0.5rem 0 0" }}>
+            The <strong>Task</strong> notifier drives issue sync (Zoho task → Paperclip issue). The <strong>Project</strong>
+            {" "}notifier links a new Zoho project to its Paperclip project so its tasks route immediately.
+            {!webhookSecret && " Set & save a Webhook Secret above to fill the scripts."}
+            {webhookSecret && " These scripts contain your live webhook secret — copy them somewhere private."}
+          </p>
+        </div>
+      )}
     </div>
   );
 }

@@ -505,6 +505,65 @@ export async function hydrateInboundPayload(
   return hydrated;
 }
 
+async function fetchProjectName(
+  ctx: PluginContext,
+  portalId: string,
+  projectId: string,
+): Promise<string | undefined> {
+  try {
+    const res = await projectsFetch(ctx, "GET", `/portal/${portalId}/projects/${projectId}/`);
+    if (!res.ok) return undefined;
+    const data = res.data as Record<string, unknown>;
+    const project = ((data.projects ?? [data]) as Array<Record<string, unknown>>)[0];
+    const name = (project?.name ?? project?.PROJECTNAME) as unknown;
+    return typeof name === "string" ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Handle a thin `type:"project"` notification. We never create issues from a
+ * project event — instead we ensure the Zoho project is linked to a Paperclip
+ * project so its tasks route immediately. Safe no-op when the project is already
+ * mapped, not allowlisted, has no resolvable company, or has no matching
+ * Paperclip project (autoLinkProject logs guidance in that case).
+ */
+export async function handleProjectNotification(
+  ctx: PluginContext,
+  raw: Record<string, unknown>,
+): Promise<void> {
+  const projectId =
+    firstString(raw, ["projectId", "project_id", "projectid"]) ??
+    firstString((raw.Project ?? raw.project ?? {}) as Record<string, unknown>, ["id", "PROJECTID"]);
+  if (!projectId) {
+    ctx.logger.debug("Project notification without a project id — ignoring");
+    return;
+  }
+
+  const config = (await ctx.config.get()) as { allowedProjectIds?: string; portalId?: string };
+  if (!isProjectAllowed(projectId, parseAllowedProjectIds(config.allowedProjectIds))) {
+    ctx.logger.info(`Project notification ${projectId} not in the configured allowlist — ignoring`);
+    return;
+  }
+
+  const mappings = await getProjectMapping(ctx);
+  if (mappings.some((m) => m.zohoProjectId === projectId)) {
+    ctx.logger.info(`Project notification ${projectId}: already linked — nothing to do`);
+    return;
+  }
+
+  const companyId = await resolveCompanyId(ctx, projectId);
+  if (!companyId) {
+    ctx.logger.info(`Project notification ${projectId}: no company resolved — add a group mapping in settings`);
+    return;
+  }
+
+  const portalId = firstString(raw, ["portalId", "portal_id"]) ?? config.portalId;
+  const name = portalId ? await fetchProjectName(ctx, portalId, projectId) : undefined;
+  await autoLinkProject(ctx, projectId, name, companyId);
+}
+
 // ─── Main handler ───────────────────────────────────────────────────────────
 
 /**
@@ -516,7 +575,15 @@ export async function handleProjectsWebhook(
   rawBody: string,
   parsedBody: unknown,
 ): Promise<void> {
-  const raw = await hydrateInboundPayload(ctx, parseWebhookBody(rawBody, parsedBody) as Record<string, unknown>);
+  const parsed = parseWebhookBody(rawBody, parsedBody) as Record<string, unknown>;
+
+  // Route project-type notifications (no task) to the project linker.
+  if (typeof parsed.type === "string" && parsed.type.toLowerCase() === "project") {
+    await handleProjectNotification(ctx, parsed);
+    return;
+  }
+
+  const raw = await hydrateInboundPayload(ctx, parsed);
   const normalized = normalizeProjectsPayload(raw);
 
   if (!normalized.taskId) {
