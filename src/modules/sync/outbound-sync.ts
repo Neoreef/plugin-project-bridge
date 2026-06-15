@@ -16,17 +16,24 @@ export async function handleIssueUpdated(
   ctx: PluginContext,
   event: PluginEvent,
 ): Promise<void> {
+  // The Paperclip server puts issueId in event.entityId and companyId at
+  // event.companyId (top level). The payload contains the flat updateFields
+  // spread (e.g. { status: "done", _previous: { status: "todo" } }).
+  const issueId = event.entityId;
+  const companyId = event.companyId;
   const payload = event.payload as {
-    issueId?: string;
-    companyId?: string;
-    changes?: { status?: { from: string; to: string } };
+    status?: string;
+    _previous?: { status?: string };
   };
 
-  if (!payload.issueId || !payload.companyId || !payload.changes?.status) {
+  const newStatus = payload.status;
+  const prevStatus = payload._previous?.status;
+
+  if (!issueId || !companyId || !newStatus || newStatus === prevStatus) {
     return;
   }
 
-  const issue = await ctx.issues.get(payload.issueId, payload.companyId);
+  const issue = await ctx.issues.get(issueId, companyId);
   if (!issue) return;
 
   // Check if this is a Zoho Projects-synced issue via the origin convention.
@@ -42,7 +49,7 @@ export async function handleIssueUpdated(
   // applied from a Zoho webhook, don't push it straight back to Zoho. The marker
   // is single-use and status-matched, so a genuine Paperclip-side change (LWW,
   // D5) still syncs outbound.
-  if (await consumeOutboundSuppression(ctx, issue.id, payload.changes.status.to)) {
+  if (await consumeOutboundSuppression(ctx, issue.id, newStatus)) {
     ctx.logger.info(
       `issue.updated for ${issue.id} originates from inbound Zoho sync — skipping outbound (loop guard)`,
     );
@@ -59,11 +66,10 @@ export async function handleIssueUpdated(
     return;
   }
 
-  const newPaperclipStatus = payload.changes.status.to;
   await syncTaskStatusToProjects(
     ctx,
     { taskId: zohoTaskId, projectId: mapping.zohoProjectId, portalId: mapping.portalId },
-    newPaperclipStatus,
+    newStatus,
   );
   // Future: desk, crm handlers
 }

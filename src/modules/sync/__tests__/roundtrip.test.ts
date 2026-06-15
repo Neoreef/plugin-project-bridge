@@ -94,11 +94,13 @@ describe("round-trip integration", () => {
     expect(suppressKey.status).toBe("todo");
 
     // 2. The host triggers issue.updated as a result of the creation (or update)
+    // Event shape: entityId/companyId at top level; flat status + _previous in payload.
     const updateEvent = {
+      entityId: "iss-1",
+      companyId: "c-1",
       payload: {
-        issueId: "iss-1",
-        companyId: "c-1",
-        changes: { status: { from: "backlog", to: "todo" } },
+        status: "todo",
+        _previous: { status: "backlog" },
       },
     };
 
@@ -124,10 +126,11 @@ describe("round-trip integration", () => {
 
     // User changes issue status to 'done' in Paperclip
     const updateEvent = {
+      entityId: "iss-1",
+      companyId: "c-1",
       payload: {
-        issueId: "iss-1",
-        companyId: "c-1",
-        changes: { status: { from: "todo", to: "done" } },
+        status: "done",
+        _previous: { status: "todo" },
       },
     };
 
