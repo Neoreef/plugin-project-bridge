@@ -200,9 +200,29 @@ const plugin: PaperclipPlugin = definePlugin({
 
     // ─── Event Listeners ──────────────────────────────────────
     ctx.events.on("issue.updated", async (event) => {
-      const config = (await ctx.config.get()) as { projectsEnabled?: boolean };
-      if (config.projectsEnabled !== false) {
-        await handleIssueUpdated(ctx, event);
+      // Guard the whole handler: a thrown error here (e.g. a transient
+      // `ctx.config.get()` DB failure, observed 2026-06-09) propagates to the
+      // host event bus, which may then drop this plugin's subscription and
+      // silently stop delivering issue.updated — breaking outbound sync. Treat a
+      // config read failure as "enabled" (fail-open) so a blip can't disable
+      // outbound, and never let the handler reject.
+      try {
+        let projectsEnabled = true;
+        try {
+          const config = (await ctx.config.get()) as { projectsEnabled?: boolean };
+          projectsEnabled = config.projectsEnabled !== false;
+        } catch (err) {
+          ctx.logger.warn(
+            `issue.updated: config.get() failed, proceeding as enabled: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        if (projectsEnabled) {
+          await handleIssueUpdated(ctx, event);
+        }
+      } catch (err) {
+        ctx.logger.error(
+          `issue.updated handler failed for ${event.entityId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     });
 
