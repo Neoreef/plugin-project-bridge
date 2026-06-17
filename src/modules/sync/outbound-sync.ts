@@ -79,17 +79,27 @@ async function syncTaskStatusToProjects(
   zoho: { taskId: string; projectId: string; portalId?: string },
   paperclipStatus: string,
 ): Promise<void> {
-  const zohoStatus = PAPERCLIP_TO_PROJECTS_STATUS[paperclipStatus];
-  if (!zohoStatus) {
-    ctx.logger.warn(`No Zoho status mapping for Paperclip status "${paperclipStatus}"`);
-    return;
-  }
-
   // Prefer the portal captured at sync time; fall back to current config.
-  const config = (await ctx.config.get()) as { portalId?: string };
+  const config = (await ctx.config.get()) as { portalId?: string; projectsStatusMapOutbound?: string };
   const portalId = zoho.portalId ?? config.portalId;
   if (!portalId || !zoho.projectId) {
     ctx.logger.warn("Missing portalId or projectId for outbound sync");
+    return;
+  }
+
+  let outboundMap: Record<string, string> = { ...PAPERCLIP_TO_PROJECTS_STATUS };
+  if (config.projectsStatusMapOutbound) {
+    try {
+      const parsed = JSON.parse(config.projectsStatusMapOutbound);
+      outboundMap = { ...outboundMap, ...parsed };
+    } catch (e) {
+      ctx.logger.warn("Failed to parse projectsStatusMapOutbound JSON override");
+    }
+  }
+
+  const zohoStatus = outboundMap[paperclipStatus];
+  if (!zohoStatus) {
+    ctx.logger.warn(`No Zoho status mapping for Paperclip status "${paperclipStatus}"`);
     return;
   }
 

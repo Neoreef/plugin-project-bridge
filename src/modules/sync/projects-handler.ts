@@ -237,9 +237,10 @@ function mapPriority(zohoPriority: string | undefined): "low" | "medium" | "high
   return (PRIORITY_MAP[zohoPriority.toLowerCase()] ?? "low") as "low" | "medium" | "high" | "critical";
 }
 
-function mapStatus(zohoStatus: string): string {
+function mapStatus(zohoStatus: string, customMap?: Record<string, string>): string {
   if (!zohoStatus) return "todo";
-  return PROJECTS_STATUS_MAP[zohoStatus.toLowerCase()] ?? "in_progress";
+  const map = customMap && Object.keys(customMap).length > 0 ? { ...PROJECTS_STATUS_MAP, ...customMap } : PROJECTS_STATUS_MAP;
+  return map[zohoStatus.toLowerCase()] ?? "in_progress";
 }
 
 type IssueStatus = "todo" | "in_progress" | "blocked" | "in_review" | "done" | "cancelled" | "backlog";
@@ -681,17 +682,27 @@ export async function handleProjectsWebhook(
     offset: 0,
   });
 
+  // Capture config + status mappings
+  const config = (await ctx.config.get()) as { portalId?: string; projectsStatusMapInbound?: string };
+  let customMap: Record<string, string> | undefined;
+  if (config.projectsStatusMapInbound) {
+    try {
+      const parsed = JSON.parse(config.projectsStatusMapInbound);
+      // lowercase keys for mapping
+      customMap = Object.fromEntries(Object.entries(parsed).map(([k, v]) => [k.toLowerCase(), String(v)]));
+    } catch (e) {
+      ctx.logger.warn("Failed to parse projectsStatusMapInbound JSON override");
+    }
+  }
+
   const existing = existingIssues.length > 0 ? existingIssues[0] : null;
-  let issueStatus = mapStatus(normalized.status) as IssueStatus;
+  let issueStatus = mapStatus(normalized.status, customMap) as IssueStatus;
   const issuePriority = mapPriority(normalized.priority);
 
   // Paperclip requires an assignee for in_progress issues — fall back to todo if unassigned
   if (issueStatus === "in_progress" && !agentId) {
     issueStatus = "todo";
   }
-
-  // Capture the portal id so outbound sync never has to guess it later.
-  const config = (await ctx.config.get()) as { portalId?: string };
 
   if (existing) {
     // Loop guard: arm the marker BEFORE the write so the resulting `issue.updated`

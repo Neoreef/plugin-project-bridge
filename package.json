@@ -12,6 +12,9 @@
     "worker": "./dist/worker.js",
     "ui": "./dist/ui/"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc && node ./scripts/build-ui.mjs",
     "clean": "rm -rf dist",

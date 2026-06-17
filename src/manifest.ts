@@ -84,6 +84,36 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "string",
         title: "Zoho Desk Organization ID",
       },
+      projectsStatusMapInbound: {
+        type: "string",
+        title: "Zoho Projects Inbound Status Map (JSON)",
+        description: "JSON override mapping Zoho Projects status to Paperclip status. Example: {\"open\": \"todo\", \"in progress\": \"in_progress\", \"completed\": \"done\"}",
+      },
+      projectsStatusMapOutbound: {
+        type: "string",
+        title: "Zoho Projects Outbound Status Map (JSON)",
+        description: "JSON override mapping Paperclip status to Zoho Projects status. Example: {\"todo\": \"Open\", \"in_progress\": \"In Progress\", \"done\": \"Closed\"}",
+      },
+      deskStatusMapInbound: {
+        type: "string",
+        title: "Zoho Desk Inbound Status Map (JSON)",
+        description: "JSON override mapping Zoho Desk status to Paperclip status.",
+      },
+      deskStatusMapOutbound: {
+        type: "string",
+        title: "Zoho Desk Outbound Status Map (JSON)",
+        description: "JSON override mapping Paperclip status to Zoho Desk status.",
+      },
+      crmStatusMapInbound: {
+        type: "string",
+        title: "Zoho CRM Inbound Status Map (JSON)",
+        description: "JSON override mapping Zoho CRM status to Paperclip status.",
+      },
+      crmStatusMapOutbound: {
+        type: "string",
+        title: "Zoho CRM Outbound Status Map (JSON)",
+        description: "JSON override mapping Paperclip status to Zoho CRM status.",
+      },
     },
   },
   jobs: [
